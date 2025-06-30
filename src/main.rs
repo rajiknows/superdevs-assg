@@ -1,9 +1,12 @@
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
+    instruction::Instruction,
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{Keypair, Signature, Signer},
+    system_instruction,
 };
+use spl_token::{instruction as token_instruction, state::Account as TokenAccount};
 use std::io;
 use std::str::FromStr;
 
@@ -32,6 +35,34 @@ struct MintTokenRequest {
     amount: u64,
 }
 
+#[derive(Deserialize)]
+struct SignMessageRequest {
+    message: String,
+    secret: String,
+}
+
+#[derive(Deserialize)]
+struct VerifyMessageRequest {
+    message: String,
+    signature: String,
+    pubkey: String,
+}
+
+#[derive(Deserialize)]
+struct SendSolRequest {
+    from: String,
+    to: String,
+    lamports: u64,
+}
+
+#[derive(Deserialize)]
+struct SendTokenRequest {
+    destination: String,
+    mint: String,
+    owner: String,
+    amount: u64,
+}
+
 impl<T> ApiResponse<T> {
     fn success(data: T) -> Self {
         Self {
@@ -50,7 +81,38 @@ impl<T> ApiResponse<T> {
     }
 }
 
-// API 1: Generate Keypair
+fn pubkey_verify(pubkey_str: &str) -> Result<Pubkey, String> {
+    Pubkey::from_str(pubkey_str).map_err(|_| "Invalid public key format".to_string())
+}
+
+fn keypair_verify(secret_str: &str) -> Result<Keypair, String> {
+    let bytes = bs58::decode(secret_str)
+        .into_vec()
+        .map_err(|_| "Invalid secret key encoding".to_string())?;
+
+    if bytes.len() != 64 {
+        return Err("Invalid secret key length".to_string());
+    }
+
+    Keypair::from_bytes(&bytes).map_err(|_| "Invalid secret key format".to_string())
+}
+
+fn instruction_to_response(instruction: Instruction) -> InstructionResponse {
+    InstructionResponse {
+        program_id: instruction.program_id.to_string(),
+        accounts: instruction
+            .accounts
+            .into_iter()
+            .map(|acc| AccountMetaResponse {
+                pubkey: acc.pubkey.to_string(),
+                is_signer: acc.is_signer,
+                is_writable: acc.is_writable,
+            })
+            .collect(),
+        instruction_data: base64::encode(&instruction.data),
+    }
+}
+
 async fn generate_keypair() -> impl IntoResponse {
     let key_pair = Keypair::new();
     let pubkey = key_pair.pubkey().to_string();
