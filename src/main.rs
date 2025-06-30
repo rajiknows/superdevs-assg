@@ -1,105 +1,42 @@
+use crate::models::{
+    AccountMetaResponse, ApiResponse, CreateTokenRequest, InstructionResponse, MintTokenRequest,
+    SendSolRequest, SendTokenRequest, SignMessageRequest, SignResponse, VerifyMessageRequest,
+    VerifyResponse, keypair_response,
+};
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
-use serde::{Deserialize, Serialize};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solana_sdk::{
     instruction::Instruction,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
     system_instruction,
 };
-use spl_token::{instruction as token_instruction, state::Account as TokenAccount};
+use spl_token::instruction as token_instruction;
 use std::io;
 use std::str::FromStr;
 
-#[derive(Serialize)]
-struct ApiResponse<T> {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CreateTokenRequest {
-    #[serde(rename = "mintAuthority")]
-    mint_authority: String,
-    mint: String,
-    decimals: u8,
-}
-
-#[derive(Deserialize)]
-struct MintTokenRequest {
-    mint: String,
-    destination: String,
-    authority: String,
-    amount: u64,
-}
-
-#[derive(Deserialize)]
-struct SignMessageRequest {
-    message: String,
-    secret: String,
-}
-
-#[derive(Deserialize)]
-struct VerifyMessageRequest {
-    message: String,
-    signature: String,
-    pubkey: String,
-}
-
-#[derive(Deserialize)]
-struct SendSolRequest {
-    from: String,
-    to: String,
-    lamports: u64,
-}
-
-#[derive(Deserialize)]
-struct SendTokenRequest {
-    destination: String,
-    mint: String,
-    owner: String,
-    amount: u64,
-}
-
-impl<T> ApiResponse<T> {
-    fn success(data: T) -> Self {
-        Self {
-            success: true,
-            data: Some(data),
-            error: None,
-        }
-    }
-
-    fn error(message: String) -> Self {
-        Self {
-            success: false,
-            data: None,
-            error: Some(message),
-        }
-    }
-}
+mod models; // Import the models module
 
 fn pubkey_verify(pubkey_str: &str) -> Result<Pubkey, String> {
-    Pubkey::from_str(pubkey_str).map_err(|_| "Invalid public key format".to_string())
+    Pubkey::from_str(pubkey_str).map_err(|_| "Invalid pubkey format".to_string())
 }
 
 fn keypair_verify(secret_str: &str) -> Result<Keypair, String> {
     let bytes = bs58::decode(secret_str)
         .into_vec()
-        .map_err(|_| "Invalid secret key encoding".to_string())?;
+        .map_err(|_| "Bad secret key encoding".to_string())?;
 
     if bytes.len() != 64 {
-        return Err("Invalid secret key length".to_string());
+        return Err("Secret key length wrong".to_string());
     }
 
-    Keypair::from_bytes(&bytes).map_err(|_| "Invalid secret key format".to_string())
+    Keypair::from_bytes(&bytes).map_err(|_| "Invalid secret key".to_string())
 }
 
 fn instruction_to_response(instruction: Instruction) -> InstructionResponse {
+    println!("Converting instruction, hope it works"); // Bad practice: debug print
     InstructionResponse {
-        program_id: instruction.program_id.to_string(),
+        programId: instruction.program_id.to_string(),
         accounts: instruction
             .accounts
             .into_iter()
@@ -109,153 +46,236 @@ fn instruction_to_response(instruction: Instruction) -> InstructionResponse {
                 is_writable: acc.is_writable,
             })
             .collect(),
-        instruction_data: base64::encode(&instruction.data),
+        instruction_data: BASE64.encode(&instruction.data),
     }
 }
 
-async fn generate_keypair() -> impl IntoResponse {
-    let key_pair = Keypair::new();
-    let pubkey = key_pair.pubkey().to_string();
-    let secret_bytes = key_pair.to_bytes();
-    let secret = bs58::encode(secret_bytes).into_string();
+async fn generate_keypair() -> (StatusCode, Json<ApiResponse<keypair_response>>) {
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey().to_string();
+    let secret = bs58::encode(keypair.to_bytes()).into_string();
 
-    let response_data = serde_json::json!({
-        "pubkey": pubkey,
-        "secret": secret
-    });
-    Json(ApiResponse::success(response_data))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(keypair_response {
+            pubkey,
+            secret_key: secret,
+        })),
+    )
 }
 
-async fn create_token(Json(payload): Json<CreateTokenRequest>) -> impl IntoResponse {
-    let mint_authority = match Pubkey::from_str(&payload.mint_authority) {
+async fn create_token(
+    Json(payload): Json<CreateTokenRequest>,
+) -> (StatusCode, Json<ApiResponse<InstructionResponse>>) {
+    let mint_authority = match pubkey_verify(&payload.mint_authority) {
         Ok(pk) => pk,
-        Err(_) => {
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let mint = match pubkey_verify(&payload.mint) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let instruction = match token_instruction::initialize_mint(
+        &spl_token::id(),
+        &mint,
+        &mint_authority,
+        None,
+        payload.decimals,
+    ) {
+        Ok(instr) => instr,
+        Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::error(
-                    "fool me once shame on you".to_string(),
-                )),
+                Json(ApiResponse::error(e.to_string())),
             );
         }
     };
 
-    let mint_pubkey = match Pubkey::from_str(&payload.mint) {
-        Ok(pk) => pk,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::error(
-                    "fool me twice,can't put the blame on you".to_string(),
-                )),
-            );
-        }
-    };
-
-    // For now, let's create a basic response structure
-    // We'll need spl-token crate for the actual instruction data
-    let response_data = serde_json::json!({
-        "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token Program ID
-        "accounts": [
-            {
-                "pubkey": mint_pubkey.to_string(),
-                "is_signer": false,
-                "is_writable": true
-            },
-            {
-                "pubkey": "SysvarRent111111111111111111111111111111111", // Rent sysvar
-                "is_signer": false,
-                "is_writable": false
-            }
-        ],
-        "instruction_data": "placeholder_instruction_data" // We'll implement this properly later
-    });
-
-    (StatusCode::OK, Json(ApiResponse::success(response_data)))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(instruction_to_response(instruction))),
+    )
 }
 
-async fn mint_token(Json(payload): Json<MintTokenRequest>) -> impl IntoResponse {
-    let mint_pubkey = match Pubkey::from_str(&payload.mint) {
+async fn mint_token(
+    Json(payload): Json<MintTokenRequest>,
+) -> (StatusCode, Json<ApiResponse<InstructionResponse>>) {
+    let mint = match pubkey_verify(&payload.mint) {
         Ok(pk) => pk,
-        Err(_) => {
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let destination = match pubkey_verify(&payload.destination) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let authority = match pubkey_verify(&payload.authority) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let instruction = match token_instruction::mint_to(
+        &spl_token::id(),
+        &mint,
+        &destination,
+        &authority,
+        &[],
+        payload.amount,
+    ) {
+        Ok(instr) => instr,
+        Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::error(
-                    "fool me three times, you're officially an idiot".to_string(),
-                )),
+                Json(ApiResponse::error(e.to_string())),
             );
         }
     };
 
-    let destination_pubkey = match Pubkey::from_str(&payload.destination) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(instruction_to_response(instruction))),
+    )
+}
+
+async fn sign_message(
+    Json(payload): Json<SignMessageRequest>,
+) -> (StatusCode, Json<ApiResponse<SignResponse>>) {
+    if payload.message.is_empty() || payload.secret.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Missing required fields".to_string())),
+        );
+    }
+
+    let keypair = match keypair_verify(&payload.secret) {
+        Ok(kp) => kp,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let message_bytes = payload.message.as_bytes();
+    let signature = keypair.sign_message(message_bytes); // Ed25519 signing
+
+    let response = SignResponse {
+        signature: BASE64.encode(signature.as_ref()),
+        public_key: keypair.pubkey().to_string(),
+        message: payload.message,
+    };
+
+    (StatusCode::OK, Json(ApiResponse::success(response)))
+}
+
+async fn verify_message(
+    Json(payload): Json<VerifyMessageRequest>,
+) -> (StatusCode, Json<ApiResponse<VerifyResponse>>) {
+    let pubkey = match pubkey_verify(&payload.pubkey) {
         Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let signature_bytes = match BASE64.decode(&payload.signature) {
+        Ok(bytes) => bytes,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::error(
-                    "destination unknown, like my future".to_string(),
-                )),
+                Json(ApiResponse::error("Invalid signature encoding".to_string())),
             );
         }
     };
 
-    let authority_pubkey = match Pubkey::from_str(&payload.authority) {
-        Ok(pk) => pk,
+    let signature = match Signature::try_from(signature_bytes.as_slice()) {
+        Ok(sig) => sig,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::error(
-                    "no authority detected, just like my life".to_string(),
-                )),
+                Json(ApiResponse::error("Invalid signature format".to_string())),
             );
         }
+    };
+
+    let message_bytes = payload.message.as_bytes();
+    let valid = signature.verify(&pubkey.to_bytes(), message_bytes);
+
+    let response = VerifyResponse {
+        valid,
+        message: payload.message,
+        pubKey: payload.pubkey,
+    };
+
+    (StatusCode::OK, Json(ApiResponse::success(response)))
+}
+
+async fn send_sol(
+    Json(payload): Json<SendSolRequest>,
+) -> (StatusCode, Json<ApiResponse<InstructionResponse>>) {
+    let from = match pubkey_verify(&payload.from) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let to = match pubkey_verify(&payload.to) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    if payload.lamports == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Lamports must be > 0".to_string())),
+        );
+    }
+
+    let instruction = system_instruction::transfer(&from, &to, payload.lamports);
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(instruction_to_response(instruction))),
+    )
+}
+
+async fn send_token(
+    Json(payload): Json<SendTokenRequest>,
+) -> (StatusCode, Json<ApiResponse<InstructionResponse>>) {
+    let owner = match pubkey_verify(&payload.owner) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let mint = match pubkey_verify(&payload.mint) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
+    };
+
+    let destination = match pubkey_verify(&payload.destination) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
     if payload.amount == 0 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::error("zero amount? sheesh".to_string())),
+            Json(ApiResponse::error("Amount must be > 0".to_string())),
         );
     }
 
-    let response_data = serde_json::json!({
-        "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        "accounts": [
-            {
-                "pubkey": mint_pubkey.to_string(),
-                "is_signer": false,
-                "is_writable": true
-            },
-            {
-                "pubkey": destination_pubkey.to_string(),
-                "is_signer": false,
-                "is_writable": true
-            },
-            {
-                "pubkey": authority_pubkey.to_string(),
-                "is_signer": true,
-                "is_writable": false
-            }
-        ],
-        "instruction_data": "mint_tokens_instruction_placeholder"
-    });
+    let source = spl_associated_token_account::get_associated_token_address(&owner, &mint);
 
-    (StatusCode::OK, Json(ApiResponse::success(response_data)))
-}
+    let instruction = token_instruction::transfer(
+        &spl_token::id(),
+        &source,
+        &destination,
+        &owner,
+        &[],
+        payload.amount,
+    )
+    .unwrap();
 
-async fn sign_message() -> impl IntoResponse {
-    Json(ApiResponse::<()>::error("Not implemented yet".to_string()))
-}
-
-async fn verify_message() -> impl IntoResponse {
-    Json(ApiResponse::<()>::error("Not implemented yet".to_string()))
-}
-
-async fn send_sol() -> impl IntoResponse {
-    Json(ApiResponse::<()>::error("Not implemented yet".to_string()))
-}
-
-async fn send_token() -> impl IntoResponse {
-    Json(ApiResponse::<()>::error("Not implemented yet".to_string()))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(instruction_to_response(instruction))),
+    )
 }
 
 #[tokio::main]
@@ -268,7 +288,12 @@ async fn main() -> io::Result<()> {
         .route("/message/verify", post(verify_message))
         .route("/send/sol", post(send_sol))
         .route("/send/token", post(send_token));
-    let addr = format!("0.0.0.0:8080");
+
+    let port = "8080";
+    let addr = format!("0.0.0.0:{}", port);
+
+    println!("Server up at {}, let's go!", addr);
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
