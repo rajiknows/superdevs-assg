@@ -9,20 +9,41 @@ pub struct ApiResponse<T> {
     pub error: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct keypair_response {
-    pub pubkey: String,
-    pub secret_key: String,
+impl<T: Serialize> ApiResponse<T> {
+    pub fn success(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+
+    pub fn error(message: String) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message),
+        }
+    }
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct keypair_response {
+    pub pubkey: String,
+    pub secret: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstructionResponse {
-    pub programId: String,
+    pub program_id: String,
     pub accounts: Vec<AccountMetaResponse>,
     pub instruction_data: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountMetaResponse {
     pub pubkey: String,
     pub is_signer: bool,
@@ -30,6 +51,7 @@ pub struct AccountMetaResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignResponse {
     pub signature: String,
     pub public_key: String,
@@ -37,10 +59,11 @@ pub struct SignResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VerifyResponse {
     pub valid: bool,
     pub message: String,
-    pub pubKey: String,
+    pub pub_key: String,
 }
 
 #[derive(Deserialize)]
@@ -64,7 +87,6 @@ pub struct SignMessageRequest {
     pub message: String,
     pub secret: String,
 }
-
 #[derive(Deserialize)]
 pub struct VerifyMessageRequest {
     pub message: String,
@@ -78,29 +100,10 @@ pub struct SendSolRequest {
     pub to: String,
     pub lamports: u64,
 }
-
 #[derive(Deserialize)]
 pub struct SendTokenRequest {
     pub destination: String,
     pub mint: String,
     pub owner: String,
     pub amount: u64,
-}
-
-impl<T: Serialize> ApiResponse<T> {
-    pub fn success(data: T) -> Self {
-        Self {
-            success: true,
-            data: Some(data),
-            error: None,
-        }
-    }
-
-    pub fn error(message: String) -> Self {
-        Self {
-            success: false,
-            data: None,
-            error: Some(message),
-        }
-    }
 }

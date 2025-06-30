@@ -12,31 +12,35 @@ use solana_sdk::{
     system_instruction,
 };
 use spl_token::instruction as token_instruction;
+use std::convert::TryFrom;
 use std::io;
-use std::str::FromStr;
+use std::str::FromStr; // ADDED: For Keypair::try_from
 
-mod models; // Import the models module
+mod models;
 
 fn pubkey_verify(pubkey_str: &str) -> Result<Pubkey, String> {
-    Pubkey::from_str(pubkey_str).map_err(|_| "Invalid pubkey format".to_string())
+    if pubkey_str.len() < 32 || pubkey_str.len() > 44 {
+        return Err("Pubkey length invalid".to_string());
+    }
+    Pubkey::from_str(pubkey_str).map_err(|_| "Bad pubkey format".to_string())
 }
 
 fn keypair_verify(secret_str: &str) -> Result<Keypair, String> {
     let bytes = bs58::decode(secret_str)
         .into_vec()
-        .map_err(|_| "Bad secret key encoding".to_string())?;
+        .map_err(|_| "Invalid secret key encoding".to_string())?;
 
     if bytes.len() != 64 {
         return Err("Secret key length wrong".to_string());
     }
 
-    Keypair::from_bytes(&bytes).map_err(|_| "Invalid secret key".to_string())
+    // UPDATED: Used try_from to resolve deprecation warning and provide better error handling.
+    Keypair::try_from(bytes.as_slice()).map_err(|_| "Invalid secret key format".to_string())
 }
 
 fn instruction_to_response(instruction: Instruction) -> InstructionResponse {
-    println!("Converting instruction, hope it works"); // Bad practice: debug print
     InstructionResponse {
-        programId: instruction.program_id.to_string(),
+        program_id: instruction.program_id.to_string(),
         accounts: instruction
             .accounts
             .into_iter()
@@ -59,7 +63,8 @@ async fn generate_keypair() -> (StatusCode, Json<ApiResponse<keypair_response>>)
         StatusCode::OK,
         Json(ApiResponse::success(keypair_response {
             pubkey,
-            secret_key: secret,
+            // FIX: Corrected field name from 'secret_key' to 'secret' to match models.rs
+            secret: secret,
         })),
     )
 }
@@ -77,6 +82,15 @@ async fn create_token(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
+    if payload.decimals > 9 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(
+                "Decimals must be between 0 and 9".to_string(),
+            )),
+        );
+    }
+
     let instruction = match token_instruction::initialize_mint(
         &spl_token::id(),
         &mint,
@@ -87,7 +101,7 @@ async fn create_token(
         Ok(instr) => instr,
         Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::error(e.to_string())),
             );
         }
@@ -117,6 +131,13 @@ async fn mint_token(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
+    if payload.amount == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Amount must be > 0".to_string())),
+        );
+    }
+
     let instruction = match token_instruction::mint_to(
         &spl_token::id(),
         &mint,
@@ -128,7 +149,7 @@ async fn mint_token(
         Ok(instr) => instr,
         Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::error(e.to_string())),
             );
         }
@@ -156,7 +177,7 @@ async fn sign_message(
     };
 
     let message_bytes = payload.message.as_bytes();
-    let signature = keypair.sign_message(message_bytes); // Ed25519 signing
+    let signature = keypair.sign_message(message_bytes);
 
     let response = SignResponse {
         signature: BASE64.encode(signature.as_ref()),
@@ -185,6 +206,15 @@ async fn verify_message(
         }
     };
 
+    if signature_bytes.len() != 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(
+                "Invalid signature length, must be 64 bytes".to_string(),
+            )),
+        );
+    }
+
     let signature = match Signature::try_from(signature_bytes.as_slice()) {
         Ok(sig) => sig,
         Err(_) => {
@@ -196,12 +226,13 @@ async fn verify_message(
     };
 
     let message_bytes = payload.message.as_bytes();
-    let valid = signature.verify(&pubkey.to_bytes(), message_bytes);
+    let valid = signature.verify(pubkey.as_ref(), message_bytes);
 
     let response = VerifyResponse {
         valid,
         message: payload.message,
-        pubKey: payload.pubkey,
+        // FIX: Corrected field name from 'pubKey' to 'pub_key' to match models.rs
+        pub_key: payload.pubkey,
     };
 
     (StatusCode::OK, Json(ApiResponse::success(response)))
@@ -219,6 +250,15 @@ async fn send_sol(
         Ok(pk) => pk,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
+
+    if from == to {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(
+                "'from' and 'to' addresses cannot be the same".to_string(),
+            )),
+        );
+    }
 
     if payload.lamports == 0 {
         return (
@@ -248,10 +288,19 @@ async fn send_token(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
-    let destination = match pubkey_verify(&payload.destination) {
+    let destination_user_address = match pubkey_verify(&payload.destination) {
         Ok(pk) => pk,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
+
+    if owner == destination_user_address {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(
+                "'owner' and 'destination' addresses cannot be the same".to_string(),
+            )),
+        );
+    }
 
     if payload.amount == 0 {
         return (
@@ -260,17 +309,28 @@ async fn send_token(
         );
     }
 
-    let source = spl_associated_token_account::get_associated_token_address(&owner, &mint);
+    let source_ata = spl_associated_token_account::get_associated_token_address(&owner, &mint);
+    let destination_ata = spl_associated_token_account::get_associated_token_address(
+        &destination_user_address,
+        &mint,
+    );
 
-    let instruction = token_instruction::transfer(
+    let instruction = match token_instruction::transfer(
         &spl_token::id(),
-        &source,
-        &destination,
+        &source_ata,
+        &destination_ata,
         &owner,
         &[],
         payload.amount,
-    )
-    .unwrap();
+    ) {
+        Ok(instr) => instr,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            );
+        }
+    };
 
     (
         StatusCode::OK,
