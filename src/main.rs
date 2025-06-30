@@ -1,10 +1,10 @@
-use crate::models::{
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use models::{
     AccountMetaResponse, ApiResponse, CreateTokenRequest, InstructionResponse, MintTokenRequest,
     SendSolRequest, SendTokenRequest, SignMessageRequest, SignResponse, VerifyMessageRequest,
     VerifyResponse, keypair_response,
 };
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use solana_sdk::{
     instruction::Instruction,
     pubkey::Pubkey,
@@ -14,8 +14,7 @@ use solana_sdk::{
 use spl_token::instruction as token_instruction;
 use std::convert::TryFrom;
 use std::io;
-use std::str::FromStr; // ADDED: For Keypair::try_from
-
+use std::str::FromStr;
 mod models;
 
 fn pubkey_verify(pubkey_str: &str) -> Result<Pubkey, String> {
@@ -34,7 +33,6 @@ fn keypair_verify(secret_str: &str) -> Result<Keypair, String> {
         return Err("Secret key length wrong".to_string());
     }
 
-    // UPDATED: Used try_from to resolve deprecation warning and provide better error handling.
     Keypair::try_from(bytes.as_slice()).map_err(|_| "Invalid secret key format".to_string())
 }
 
@@ -61,11 +59,7 @@ async fn generate_keypair() -> (StatusCode, Json<ApiResponse<keypair_response>>)
 
     (
         StatusCode::OK,
-        Json(ApiResponse::success(keypair_response {
-            pubkey,
-            // FIX: Corrected field name from 'secret_key' to 'secret' to match models.rs
-            secret: secret,
-        })),
+        Json(ApiResponse::success(keypair_response { pubkey, secret })),
     )
 }
 
@@ -98,7 +92,7 @@ async fn create_token(
         None,
         payload.decimals,
     ) {
-        Ok(instr) => instr,
+        Ok(ix) => ix,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -146,7 +140,7 @@ async fn mint_token(
         &[],
         payload.amount,
     ) {
-        Ok(instr) => instr,
+        Ok(ix) => ix,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -176,8 +170,7 @@ async fn sign_message(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
-    let message_bytes = payload.message.as_bytes();
-    let signature = keypair.sign_message(message_bytes);
+    let signature = keypair.sign_message(payload.message.as_bytes());
 
     let response = SignResponse {
         signature: BASE64.encode(signature.as_ref()),
@@ -196,8 +189,8 @@ async fn verify_message(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
-    let signature_bytes = match BASE64.decode(&payload.signature) {
-        Ok(bytes) => bytes,
+    let sig_bytes = match BASE64.decode(&payload.signature) {
+        Ok(b) => b,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -206,7 +199,7 @@ async fn verify_message(
         }
     };
 
-    if signature_bytes.len() != 64 {
+    if sig_bytes.len() != 64 {
         return (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error(
@@ -215,7 +208,7 @@ async fn verify_message(
         );
     }
 
-    let signature = match Signature::try_from(signature_bytes.as_slice()) {
+    let signature = match Signature::try_from(sig_bytes.as_slice()) {
         Ok(sig) => sig,
         Err(_) => {
             return (
@@ -225,13 +218,11 @@ async fn verify_message(
         }
     };
 
-    let message_bytes = payload.message.as_bytes();
-    let valid = signature.verify(pubkey.as_ref(), message_bytes);
+    let valid = signature.verify(pubkey.as_ref(), payload.message.as_bytes());
 
     let response = VerifyResponse {
         valid,
         message: payload.message,
-        // FIX: Corrected field name from 'pubKey' to 'pub_key' to match models.rs
         pub_key: payload.pubkey,
     };
 
@@ -288,12 +279,12 @@ async fn send_token(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
-    let destination_user_address = match pubkey_verify(&payload.destination) {
+    let dest = match pubkey_verify(&payload.destination) {
         Ok(pk) => pk,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e))),
     };
 
-    if owner == destination_user_address {
+    if owner == dest {
         return (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error(
@@ -310,20 +301,17 @@ async fn send_token(
     }
 
     let source_ata = spl_associated_token_account::get_associated_token_address(&owner, &mint);
-    let destination_ata = spl_associated_token_account::get_associated_token_address(
-        &destination_user_address,
-        &mint,
-    );
+    let dest_ata = spl_associated_token_account::get_associated_token_address(&dest, &mint);
 
     let instruction = match token_instruction::transfer(
         &spl_token::id(),
         &source_ata,
-        &destination_ata,
+        &dest_ata,
         &owner,
         &[],
         payload.amount,
     ) {
-        Ok(instr) => instr,
+        Ok(ix) => ix,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -349,9 +337,7 @@ async fn main() -> io::Result<()> {
         .route("/send/sol", post(send_sol))
         .route("/send/token", post(send_token));
 
-    let port = "8080";
-    let addr = format!("0.0.0.0:{}", port);
-
+    let addr = "0.0.0.0:8080";
     println!("Server up at {}, let's go!", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
